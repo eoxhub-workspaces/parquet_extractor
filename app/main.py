@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Parquet Statistics Endpoint",
-    description="API to extract and filter data from S3 Parquet files based on datetime, cluster_id, and subcluster_id.",
+    description="API to extract and filter data from S3 Parquet files based on datetime, parent_cluster_id, cluster_id, and earthcare_id.",
     version="1.0.0",
 )
 
@@ -31,6 +31,7 @@ async def get_parquet_data(
     ),
     parent_cluster_id: int = Query(..., description="The parent cluster ID to filter the data."),
     cluster_id: int = Query(..., description="The cluster ID to filter the data."),
+    earthcare_id: str = Query(..., description="The EarthCARE ID to filter the data."),
     parquet_base_url: str = Query(
         "https://s3.waw4-1.cloudferro.com/EarthCODE/OSCAssets/storm-data/EC_lightning_GLM",
         description="Base S3 URL for the Parquet files (e.g., 'https://s3.waw4-1.cloudferro.com/EarthCODE/OSCAssets/storm-data/GLM'). The year and month will be appended to this."
@@ -44,13 +45,14 @@ async def get_parquet_data(
     """
     Retrieves and filters data from a monthly Parquet file stored on S3.
     The Parquet file is determined by the `datetime_str` (e.g., `GLM_2024_10.parquet`).
-    Data is then filtered by `parent_cluster_id` and `cluster_id`.
+    Data is then filtered by `parent_cluster_id`, `cluster_id`, and `earthcare_id`.
     """
     try:
         data = await get_filtered_parquet_data(
             datetime_str=datetime_str,
             parent_cluster_id=parent_cluster_id,
             cluster_id=cluster_id,
+            earthcare_id=earthcare_id,
             parquet_base_url=parquet_base_url,
             output_format=output_format
         )

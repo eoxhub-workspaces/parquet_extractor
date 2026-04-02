@@ -5,6 +5,8 @@ import logging
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
 import s3fs
+import shapely.wkb
+import shapely.geometry
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,7 @@ async def get_filtered_parquet_data(
     datetime_str: str,
     parent_cluster_id: int,
     cluster_id: int,
+    earthcare_id: str,
     parquet_base_url: str,
     output_format: str = "json"
 ) -> str:
@@ -40,6 +43,7 @@ async def get_filtered_parquet_data(
         datetime_str: A datetime string (e.g., "2024-10-26T10:00:00Z") to determine the Parquet file.
         parent_cluster_id: The parent cluster ID to filter by.
         cluster_id: The cluster ID to filter by.
+        earthcare_id: The EarthCARE ID to filter by.
         parquet_base_url: The base S3 URL for the Parquet files (e.g., "https://s3.waw4-1.cloudferro.com/EarthCODE/OSCAssets/storm-data/EC_lightning_GLM").
         output_format: The desired output format ("json" or "csv").
 
@@ -76,20 +80,23 @@ async def get_filtered_parquet_data(
         
         # Define the filter expression. This will be pushed down to the file scan.
         filter_expression = (
+            (ds.field('earthcare_id') == earthcare_id) &
             (ds.field('parent_cluster_id') == parent_cluster_id) & 
             (ds.field('cluster_id') == cluster_id)
         )
         
         table = dataset.to_table(filter=filter_expression)
         filtered_df = table.to_pandas()
+
+        downloaded_mb = table.nbytes / (1024 * 1024)
         
-        logger.info(f"Successfully read and filtered Parquet file. Rows returned: {len(filtered_df)}")
+        logger.info(f"Successfully read and filtered Parquet file. Rows returned: {len(filtered_df)}, Data loaded: {downloaded_mb:.2f} MB")
     except Exception as e:
         logger.error(f"Failed to read Parquet file from {parquet_url}. Error: {e}")
         raise RuntimeError(f"Could not read Parquet file: {parquet_url}. Please check the URL and S3 bucket permissions. Error: {e}")
 
     if filtered_df.empty:
-        logger.warning(f"No data found for parent_cluster_id={parent_cluster_id}, cluster_id={cluster_id} in {parquet_url}")
+        logger.warning(f"No data found for parent_cluster_id={parent_cluster_id}, cluster_id={cluster_id}, earthcare_id='{earthcare_id}' in {parquet_url}")
         if output_format == "json":
             return "[]"
         else: # csv
@@ -97,8 +104,27 @@ async def get_filtered_parquet_data(
             # Returning an empty string is simpler if no data.
             return ""
 
+    def _sanitize_value(value, column_name):
+        """Helper to decode bytes and clean strings for JSON serialization."""
+        if isinstance(value, bytes):
+            if column_name == 'geometry':
+                try:
+                    # Decode WKB to a shapely geometry, then to a GeoJSON-like dict
+                    return shapely.geometry.mapping(shapely.wkb.loads(value))
+                except Exception:
+                    # If it's not valid WKB, return a placeholder
+                    return "invalid_geometry_data"
+            # For other byte columns, decode with replacement for bad characters
+            return value.decode('utf-8', 'replace')
+        # If it's not bytes (e.g., already a string, number), just convert to string
+        return str(value) if pd.notna(value) else None
+
     if output_format == "json":
-        return filtered_df.to_json(orient="records", date_format="iso")
+        # Sanitize object columns to prevent UTF-8 encoding errors with ujson
+        for col in filtered_df.select_dtypes(include=['object']).columns:
+            filtered_df[col] = filtered_df[col].apply(lambda x: _sanitize_value(x, col))
+        
+        return filtered_df.to_json(orient="records", date_format="iso", force_ascii=False)
     elif output_format == "csv":
         # Use io.StringIO to capture CSV output as a string
         csv_buffer = io.StringIO()
