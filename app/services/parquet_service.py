@@ -4,9 +4,10 @@ import io
 import logging
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
+from typing import Optional, List
 import s3fs
 import shapely.wkb
-import shapely.geometry
+import shapely.geometry as shapely_geometry
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,7 @@ async def get_filtered_parquet_data(
             if column_name == 'geometry':
                 try:
                     # Decode WKB to a shapely geometry, then to a GeoJSON-like dict
-                    return shapely.geometry.mapping(shapely.wkb.loads(value))
+                    return shapely_geometry.mapping(shapely.wkb.loads(value))
                 except Exception:
                     # If it's not valid WKB, return a placeholder
                     return "invalid_geometry_data"
@@ -132,3 +133,95 @@ async def get_filtered_parquet_data(
         return csv_buffer.getvalue()
     else:
         raise ValueError(f"Unsupported output format: {output_format}. Must be 'json' or 'csv'.")
+
+
+def _format_stat(value):
+    """Helper to decode bytes for cleaner display."""
+    if isinstance(value, bytes):
+        try:
+            # Attempt to decode as UTF-8 for a clean string representation
+            return value.decode('utf-8')
+        except UnicodeDecodeError:
+            # If it fails, show the raw byte representation
+            return repr(value)
+    return value
+
+def get_parquet_metadata(parquet_url: str, columns_to_inspect: Optional[List[str]] = None):
+    """
+    Reads a Parquet file from a URL (local or remote S3/HTTP) and extracts
+    its metadata and row group statistics.
+    """
+    try:
+        parsed_url = urlparse(parquet_url)
+        
+        # Determine if it's an S3-like URL and construct the filesystem object
+        if parsed_url.scheme in ['s3', 'http', 'https'] and 's3' in parsed_url.netloc:
+            endpoint_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            s3_path = parsed_url.path.lstrip('/')
+            fs = s3fs.S3FileSystem(anon=True, client_kwargs={'endpoint_url': endpoint_url})
+            parquet_file = pq.ParquetFile(s3_path, filesystem=fs)
+        else:
+            # Fallback for local files or other schemes pyarrow might handle natively
+            parquet_file = pq.ParquetFile(parquet_url)
+        # (e.g., s3fs for s3://).
+        # The FileMetaData object contains basic file-level metadata.
+        metadata = parquet_file.metadata
+        # The ParquetFile.schema_arrow property gives us the full pyarrow.Schema object we need.
+        arrow_schema = parquet_file.schema_arrow
+
+        # --- Prepare File Metadata ---
+        file_metadata = {
+            "total_rows": metadata.num_rows,
+            "num_row_groups": metadata.num_row_groups,
+            "schema": str(arrow_schema),
+        }
+
+        # --- Prepare Row Group Statistics ---
+        row_groups_stats = []
+
+        # If no columns are specified, inspect all columns.
+        if not columns_to_inspect:
+            columns_to_inspect = arrow_schema.names
+
+        for i in range(metadata.num_row_groups):
+            row_group_meta = metadata.row_group(i)
+            group_info = {
+                "row_group_id": i,
+                "total_rows": row_group_meta.num_rows,
+                "columns": []
+            }
+
+            for col_name in columns_to_inspect:
+                col_info = {"column_name": col_name}
+                try:
+                    col_index = arrow_schema.get_field_index(col_name)
+                    if col_index == -1:
+                        col_info["status"] = "Not found in schema"
+                    else:
+                        column_meta = row_group_meta.column(col_index)
+                        if column_meta.statistics:
+                            stats = column_meta.statistics
+                            col_info["statistics"] = {
+                                "min": _format_stat(stats.min),
+                                "max": _format_stat(stats.max),
+                                "has_nulls": stats.has_null_count and stats.null_count > 0,
+                                "null_count": stats.null_count,
+                                "num_values": stats.num_values,
+                            }
+                        else:
+                            col_info["status"] = "No statistics available"
+                except Exception as col_e:
+                    col_info["status"] = f"Error reading stats: {col_e}"
+
+                group_info["columns"].append(col_info)
+
+            row_groups_stats.append(group_info)
+
+        return {
+            "file_metadata": file_metadata,
+            "row_group_statistics": row_groups_stats
+        }
+
+    except Exception as e:
+        # Let the caller handle the HTTPException
+        raise RuntimeError(f"An error occurred while inspecting Parquet metadata: {e}")

@@ -1,10 +1,10 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
-from typing import Optional
+from typing import Optional, List
 import logging
 import io
 
-from .services.parquet_service import get_filtered_parquet_data
+from .services.parquet_service import get_filtered_parquet_data, get_parquet_metadata
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -75,3 +75,29 @@ async def get_parquet_data(
     except Exception as e:
         logger.exception("An unexpected error occurred.")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+
+@app.get("/inspect/", summary="Inspect Parquet file metadata")
+async def inspect_parquet_url(
+    url: str = Query(..., description="The full URL to the Parquet file (e.g., `s3://...`, `http://...`, `file://...`)."),
+    columns: Optional[List[str]] = Query(None, description="A list of column names to inspect. If not provided, all columns are inspected.")
+):
+    """
+    Inspects a Parquet file from a given URL and returns its metadata and
+    column-level statistics for each row group.
+
+    - **url**: The full URL to the Parquet file.
+    - **columns**: Optional query parameter to specify which columns to inspect.
+      Can be provided multiple times (e.g., `?columns=col1&columns=col2`).
+    """
+    try:
+        metadata = get_parquet_metadata(url, columns)
+        return metadata
+    except ValueError as e:
+        logger.error(f"Validation error for URL {url}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        logger.error(f"Runtime error during Parquet inspection for URL {url}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred during inspection of {url}.")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred during inspection.")
