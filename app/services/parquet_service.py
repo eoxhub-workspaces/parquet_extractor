@@ -22,8 +22,8 @@ def _construct_parquet_url(base_url: str, datetime_str: str) -> str:
         dt_obj = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
         year = dt_obj.year
         month = dt_obj.month
-        # Format: base_url_YYYY_MM.parquet
-        parquet_filename = f"{base_url}_{year}_{month:02d}.parquet"
+        # Format: base_url_YYYY_M.parquet
+        parquet_filename = f"{base_url}_{year}_{month}.parquet"
         return parquet_filename
     except ValueError as e:
         logger.error(f"Invalid datetime string format: {datetime_str}. Error: {e}")
