@@ -1,10 +1,13 @@
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 import io
 import logging
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
 from typing import Optional, List
+import json
+import geopandas as gpd
+import pystac
 import s3fs
 import shapely.wkb
 import shapely.geometry as shapely_geometry
@@ -35,7 +38,8 @@ async def get_filtered_parquet_data(
     cluster_id: int,
     earthcare_id: str,
     parquet_base_url: str,
-    output_format: str = "json"
+    output_format: str = "json",
+    columns_to_extract: Optional[List[str]] = None
 ) -> str:
     """
     Fetches, filters, and returns data from a Parquet file on S3.
@@ -45,8 +49,9 @@ async def get_filtered_parquet_data(
         parent_cluster_id: The parent cluster ID to filter by.
         cluster_id: The cluster ID to filter by.
         earthcare_id: The EarthCARE ID to filter by.
-        parquet_base_url: The base S3 URL for the Parquet files (e.g., "https://s3.waw4-1.cloudferro.com/EarthCODE/OSCAssets/storm-data/EC_lightning_GLM").
-        output_format: The desired output format ("json" or "csv").
+        parquet_base_url: The base URL for the Parquet files (e.g., "https://s3.waw4-1.cloudferro.com/EarthCODE/OSCAssets/storm-data/EC_lightning_GLM").
+        output_format: The desired output format ("json", "csv", or "geojson").
+        columns_to_extract: An optional list of column names to extract.
 
     Returns:
         A string containing the filtered data in the specified format.
@@ -56,27 +61,24 @@ async def get_filtered_parquet_data(
 
     try:
         parsed_url = urlparse(parquet_url)
+        filesystem = None
+        source = parquet_url
         
-        # For S3-compatible storage, we must provide the endpoint URL.
-        # We construct it from the scheme (http/https) and netloc (the domain).
-        endpoint_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        # The path for s3fs should not have a leading slash.
-        s3_path = parsed_url.path.lstrip('/')
-        
-        # Create the filesystem object with the correct endpoint for this specific request.
-        # anon=True is equivalent to the AWS CLI's --no-sign-request.
-        s3 = s3fs.S3FileSystem(anon=True, client_kwargs={'endpoint_url': endpoint_url})
-
-        logger.info(f"Attempting to read S3 path: '{s3_path}' from endpoint: '{endpoint_url}'")
-
+        # Use s3fs for s3:// URLs or for http(s) URLs pointing to S3-compatible storage.
+        # Otherwise, let pyarrow handle the http(s) URL or local path directly.
+        if parsed_url.scheme == 's3' or 's3' in parsed_url.netloc:
+            endpoint_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            source = parsed_url.path.lstrip('/')
+            filesystem = s3fs.S3FileSystem(anon=True, client_kwargs={'endpoint_url': endpoint_url})
+            logger.info(f"Using s3fs for path: '{source}' at endpoint: '{endpoint_url}'")
+        else:
+            logger.info(f"Using pyarrow's native handler for URL: '{source}'")
+       
         # Use the pyarrow.dataset API for more robust predicate pushdown.
-        # This API is designed to scan datasets and apply filters before loading data into memory,
-        # which is more efficient for remote filesystems like S3.
         dataset = ds.dataset(
             s3_path,
-            filesystem=s3,
-            format="parquet"
+            source,
+            filesystem=filesystem,
         )
         
         # Define the filter expression. This will be pushed down to the file scan.
@@ -86,7 +88,7 @@ async def get_filtered_parquet_data(
             (ds.field('cluster_id') == cluster_id)
         )
         
-        table = dataset.to_table(filter=filter_expression)
+        table = dataset.to_table(filter=filter_expression, columns=columns_to_extract)
         filtered_df = table.to_pandas()
 
         downloaded_mb = table.nbytes / (1024 * 1024)
@@ -98,7 +100,7 @@ async def get_filtered_parquet_data(
 
     if filtered_df.empty:
         logger.warning(f"No data found for parent_cluster_id={parent_cluster_id}, cluster_id={cluster_id}, earthcare_id='{earthcare_id}' in {parquet_url}")
-        if output_format == "json":
+        if output_format in ["json", "geojson"]:
             return "[]"
         else: # csv
             # For CSV, an empty string or just headers might be returned.
@@ -127,13 +129,106 @@ async def get_filtered_parquet_data(
         
         return filtered_df.to_json(orient="records", date_format="iso", force_ascii=False)
     elif output_format == "csv":
-        # Use io.StringIO to capture CSV output as a string
         csv_buffer = io.StringIO()
         filtered_df.to_csv(csv_buffer, index=False)
         return csv_buffer.getvalue()
-    else:
-        raise ValueError(f"Unsupported output format: {output_format}. Must be 'json' or 'csv'.")
+    elif output_format == "geojson":
+        features = []
+        for _, row in filtered_df.iterrows():
+            properties = row.to_dict()
+            geometry_wkb = properties.pop('geometry', None)
+            
+            if geometry_wkb:
+                try:
+                    geom = shapely.wkb.loads(geometry_wkb)
+                    geometry = shapely_geometry.mapping(geom)
+                except Exception:
+                    geometry = None
+            else:
+                geometry = None
 
+            # Sanitize properties for JSON
+            sanitized_properties = {k: _sanitize_value(v, k) for k, v in properties.items()}
+
+            features.append({
+                "type": "Feature",
+                "geometry": geometry,
+                "properties": sanitized_properties
+            })
+        
+        feature_collection = {"type": "FeatureCollection", "features": features}
+        return json.dumps(feature_collection)
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}. Must be 'json', 'csv', or 'geojson'.")
+
+async def get_geojson_from_parquet_url(
+    parquet_url: str,
+    start_time: str,
+    end_time: str,
+    columns_to_extract: Optional[List[str]] = None
+) -> str:
+    """
+    Fetches and filters a single Parquet file by a time range and returns GeoJSON.
+    """
+    logger.info(f"Reading single Parquet URL: {parquet_url}")
+
+    try:
+        parsed_url = urlparse(parquet_url)
+        filesystem = None
+        source = parquet_url
+
+        if parsed_url.scheme == 's3' or 's3' in parsed_url.netloc:
+            endpoint_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            source = parsed_url.path.lstrip('/')
+            filesystem = s3fs.S3FileSystem(anon=True, client_kwargs={'endpoint_url': endpoint_url})
+        
+        start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+        end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+
+        dataset = ds.dataset(source, filesystem=filesystem, format="parquet")
+        
+        filter_expression = (
+            (ds.field('peak_datetime') >= start_dt) &
+            (ds.field('peak_datetime') < end_dt)
+        )
+
+        # Ensure geometry is always included for GeoJSON
+        final_columns = columns_to_extract
+        if columns_to_extract:
+            if 'geometry' not in columns_to_extract:
+                final_columns = columns_to_extract + ['geometry']
+        
+        table = dataset.to_table(filter=filter_expression, columns=final_columns)
+        df = table.to_pandas()
+
+    except Exception as e:
+        logger.error(f"Failed to read or filter Parquet file from {parquet_url}. Error: {e}")
+        raise RuntimeError(f"Could not process Parquet file: {parquet_url}. Error: {e}")
+
+    if df.empty:
+        return json.dumps({"type": "FeatureCollection", "features": []})
+
+    features = []
+    for _, row in df.iterrows():
+        properties = row.to_dict()
+        geometry_wkb = properties.pop('geometry', None)
+        
+        if geometry_wkb:
+            try:
+                geom = shapely.wkb.loads(geometry_wkb)
+                geometry = shapely_geometry.mapping(geom)
+            except Exception:
+                geometry = None
+        else:
+            geometry = None
+
+        features.append({
+            "type": "Feature",
+            "geometry": geometry,
+            "properties": {k: str(v) if pd.notna(v) else None for k, v in properties.items()}
+        })
+
+    return json.dumps({"type": "FeatureCollection", "features": features})
 
 def _format_stat(value):
     """Helper to decode bytes for cleaner display."""
@@ -153,17 +248,18 @@ def get_parquet_metadata(parquet_url: str, columns_to_inspect: Optional[List[str
     """
     try:
         parsed_url = urlparse(parquet_url)
+        filesystem = None
+        source = parquet_url
         
         # Determine if it's an S3-like URL and construct the filesystem object
-        if parsed_url.scheme in ['s3', 'http', 'https'] and 's3' in parsed_url.netloc:
+        if parsed_url.scheme == 's3' or 's3' in parsed_url.netloc:
             endpoint_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            s3_path = parsed_url.path.lstrip('/')
-            fs = s3fs.S3FileSystem(anon=True, client_kwargs={'endpoint_url': endpoint_url})
-            parquet_file = pq.ParquetFile(s3_path, filesystem=fs)
+            source = parsed_url.path.lstrip('/')
+            filesystem = s3fs.S3FileSystem(anon=True, client_kwargs={'endpoint_url': endpoint_url})
+            parquet_file = pq.ParquetFile(source, filesystem=filesystem)
         else:
             # Fallback for local files or other schemes pyarrow might handle natively
             parquet_file = pq.ParquetFile(parquet_url)
-        # (e.g., s3fs for s3://).
         # The FileMetaData object contains basic file-level metadata.
         metadata = parquet_file.metadata
         # The ParquetFile.schema_arrow property gives us the full pyarrow.Schema object we need.
@@ -225,3 +321,100 @@ def get_parquet_metadata(parquet_url: str, columns_to_inspect: Optional[List[str
     except Exception as e:
         # Let the caller handle the HTTPException
         raise RuntimeError(f"An error occurred while inspecting Parquet metadata: {e}")
+
+async def get_stac_geoparquet_catalog(
+    parquet_url: str,
+    service_base_url: str,
+    ) -> bytes:
+    """
+    Generates an items GeoParquet for monthly items based on provided parquet.
+    """
+    try:
+        # Use existing metadata function to get time range
+        metadata = get_parquet_metadata(parquet_url, columns_to_inspect=['peak_datetime'])
+        style_url = "https://workspace-ui-public.gtif-austria.hub-otc.eox.at/api/public/share/public-4wazei3y-02/assets/stormtracker_style.json"
+        # Find min/max from all row groups
+        all_min = []
+        all_max = []
+        for group in metadata['row_group_statistics']:
+            for col in group['columns']:
+                if col['column_name'] == 'peak_datetime' and 'statistics' in col:
+                    all_min.append(col['statistics']['min'])
+                    all_max.append(col['statistics']['max'])
+
+        if not all_min or not all_max:
+            raise ValueError("Could not determine temporal extent from 'peak_datetime' column.")
+
+        # The dates from metadata can be strings, so they need to be parsed.
+        # We also need to handle cases where they might already be datetime objects.
+        parsed_min_dates = [datetime.fromisoformat(d.replace('Z', '+00:00')) if isinstance(d, str) else d for d in all_min]
+        parsed_max_dates = [datetime.fromisoformat(d.replace('Z', '+00:00')) if isinstance(d, str) else d for d in all_max]
+
+        start_dt = min(parsed_min_dates)
+        end_dt = max(parsed_max_dates)
+
+        items = []
+        # Generate monthly STAC Items
+        for dt in pd.date_range(start_dt.replace(day=1), end_dt, freq='MS'):
+            # Set time to midnight UTC for start of month
+            item_start_time = dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+            # Set time to midnight UTC for end of month (start of next month)
+            item_end_time = (dt + pd.offsets.MonthEnd(1)).to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+
+            item = pystac.Item(
+                id=f"month-{dt.year}-{dt.month:02d}",
+                geometry=None,
+                bbox=[-90, -180, 90, 180],
+                datetime=None,
+                properties={
+                    # Format to ISO 8601 with milliseconds and 'Z' for UTC
+                    "start_datetime": item_start_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                    "end_datetime": item_end_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                },
+            )
+
+            # Add asset pointing to the new GeoJSON endpoint
+            asset_href = f"{service_base_url}/data/geojson?parquet_url={parquet_url}&start_time={item_start_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z')}&end_time={item_end_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z')}"
+            item.add_asset(
+                key="geojson_data",
+                asset=pystac.Asset(href=asset_href, media_type=pystac.MediaType.GEOJSON, roles=["data"])
+            )
+            # The links property is part of the item itself, not a separate list to append.
+            item.add_link(
+                pystac.Link(
+                    rel="style",
+                    target=style_url,
+                    media_type="text/cog-styles",
+                    extra_fields={'asset:keys': ['geojson_data']}
+                )
+            )
+            items.append(item)
+
+        # Convert STAC items to dictionaries
+        item_dicts = [item.to_dict() for item in items]
+
+        # Manually create the GeoDataFrame to ensure all STAC fields are included as columns.
+        # gpd.GeoDataFrame.from_features only extracts 'properties', 'id', and 'geometry'.
+        geometries = []
+        for item in item_dicts:
+            geom_dict = item.get('geometry')
+            # Only process the geometry if it's not None
+            geometries.append(shapely_geometry.shape(geom_dict) if geom_dict else None)
+        gdf = gpd.GeoDataFrame(item_dicts, geometry=geometries, crs="EPSG:4326")
+
+        # The 'geometry' from item_dicts is now redundant, so we can drop it.
+        gdf = gdf.drop(columns=['geometry'])
+
+        # Convert complex columns to JSON strings for Parquet compatibility
+        for col in ['assets', 'links', 'stac_extensions']:
+             if col in gdf.columns:
+                gdf[col] = gdf[col].apply(json.dumps)
+
+        # Write to an in-memory Parquet buffer
+        buffer = io.BytesIO()
+        gdf.to_parquet(buffer, index=False)
+        buffer.seek(0)
+        return buffer.getvalue()
+    except Exception as e:
+        logger.error(f"Failed to generate STAC catalog for {parquet_url}. Error: {e}")
+        raise RuntimeError(f"Could not generate STAC catalog. Error: {e}")

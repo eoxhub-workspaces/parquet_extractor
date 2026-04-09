@@ -1,10 +1,16 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import Optional, List
+import json
 import logging
 import io
 
-from .services.parquet_service import get_filtered_parquet_data, get_parquet_metadata
+from .services.parquet_service import (
+    get_filtered_parquet_data, 
+    get_parquet_metadata,
+    get_geojson_from_parquet_url,
+    get_stac_geoparquet_catalog
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -12,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Parquet Statistics Endpoint",
-    description="API to extract and filter data from S3 Parquet files based on datetime, parent_cluster_id, cluster_id, and earthcare_id.",
+    description="API to extract, filter, and inspect data from Parquet files.",
     version="1.0.0",
 )
 
@@ -36,10 +42,15 @@ async def get_parquet_data(
         "https://s3.waw4-1.cloudferro.com/EarthCODE/OSCAssets/storm-data/EC_lightning_GLM",
         description="Base S3 URL for the Parquet files (e.g., 'https://s3.waw4-1.cloudferro.com/EarthCODE/OSCAssets/storm-data/GLM'). The year and month will be appended to this."
     ),
+    columns: Optional[List[str]] = Query(
+        None, 
+        alias="columns_to_extract",
+        description="Optional list of column names to extract."
+    ),
     output_format: str = Query(
         "json",
-        description="Desired output format: 'json' or 'csv'.",
-        regex="^(json|csv)$"
+        description="Desired output format: 'json', 'csv', or 'geojson'.",
+        regex="^(json|csv|geojson)$"
     )
 ):
     """
@@ -54,11 +65,15 @@ async def get_parquet_data(
             cluster_id=cluster_id,
             earthcare_id=earthcare_id,
             parquet_base_url=parquet_base_url,
-            output_format=output_format
+            output_format=output_format,
+            columns_to_extract=columns
         )
 
-        if output_format == "json":
-            return JSONResponse(content=data, media_type="application/json")
+        if output_format in ["json", "geojson"]:
+            # The service returns a JSON string, so we parse it back to a dict/list
+            # for FastAPI to handle correctly.
+            json_content = json.loads(data)
+            return JSONResponse(content=json_content, media_type="application/json")
         elif output_format == "csv":
             # StreamingResponse is suitable for returning large CSV data
             return StreamingResponse(io.StringIO(data), media_type="text/csv")
@@ -101,3 +116,70 @@ async def inspect_parquet_url(
     except Exception as e:
         logger.exception(f"An unexpected error occurred during inspection of {url}.")
         raise HTTPException(status_code=500, detail="An unexpected error occurred during inspection.")
+
+@app.get("/data/geojson", summary="Get GeoJSON data from a Parquet file by time range")
+async def get_geojson_data(
+    parquet_url: str = Query(..., description="The full URL to the Parquet file."),
+    start_time: str = Query(..., description="Start of the time range in ISO 8601 format (e.g., '2024-10-26T10:00:00Z')."),
+    end_time: str = Query(..., description="End of the time range in ISO 8601 format (e.g., '2024-10-26T12:00:00Z')."),
+    columns: Optional[List[str]] = Query(None, alias="columns_to_extract", description="Optional list of column names to extract.")
+):
+    """
+    Directly queries a single Parquet file, filters the data by a specified
+    time range on the `peak_datetime` column, and returns the result as a GeoJSON FeatureCollection.
+    """
+    try:
+        geojson_data = await get_geojson_from_parquet_url(
+            parquet_url=parquet_url,
+            start_time=start_time,
+            end_time=end_time,
+            columns_to_extract=columns
+        )
+        # The service returns a GeoJSON string, so we parse it for a proper JSON response
+        json_content = json.loads(geojson_data)
+        return JSONResponse(content=json_content, media_type="application/geo+json")
+    except ValueError as e:
+        logger.error(f"Validation error for GeoJSON query on {parquet_url}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        logger.error(f"Runtime error during GeoJSON processing for {parquet_url}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred during GeoJSON query of {parquet_url}.")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+
+@app.get("/stac/geoparquet", summary="Generate a STAC Catalog for a GeoParquet file")
+async def get_stac_catalog(
+    request: Request,
+    parquet_url: str = Query(..., description="The full URL to the Parquet file to be cataloged.")
+):
+    """
+    Generates a STAC (SpatioTemporal Asset Catalog) for a given Parquet file.
+    It creates monthly STAC Items, where each item's asset points to the
+    `/data/geojson` endpoint to dynamically fetch data for that month.
+    """
+    try:
+        # Construct the base URL of this service from the incoming request
+        # This is needed to build the asset links in the STAC items.
+        service_base_url = str(request.base_url).rstrip('/')
+        
+        parquet_bytes = await get_stac_geoparquet_catalog(
+            parquet_url=parquet_url,
+            service_base_url=service_base_url
+        )
+        
+        # Return the generated Parquet file as a streaming response
+        return StreamingResponse(
+            io.BytesIO(parquet_bytes),
+            media_type="application/x-parquet",
+            headers={"Content-Disposition": "attachment; filename=stac_catalog.parquet"}
+        )
+    except ValueError as e:
+        logger.error(f"Validation error for STAC generation on {parquet_url}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        logger.error(f"Runtime error during STAC generation for {parquet_url}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred during STAC generation for {parquet_url}.")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
