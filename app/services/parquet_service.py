@@ -7,6 +7,7 @@ import pyarrow.dataset as ds
 from typing import Optional, List
 import json
 import geopandas as gpd
+from shapely.geometry import box
 import pystac
 import s3fs
 import shapely.wkb
@@ -360,12 +361,12 @@ async def get_stac_geoparquet_catalog(
             item_start_time = dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
             # Set time to midnight UTC for end of month (start of next month)
             item_end_time = (dt + pd.offsets.MonthEnd(1)).to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-
+            geom = box(-180, -90, 180, 90)
             item = pystac.Item(
                 id=f"month-{dt.year}-{dt.month:02d}",
-                geometry=None,
-                bbox=[-90, -180, 90, 180],
-                datetime=None,
+                geometry=geom,
+                bbox=list(geom.bounds),
+                datetime=item_start_time,
                 properties={
                     # Format to ISO 8601 with milliseconds and 'Z' for UTC
                     "start_datetime": item_start_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
@@ -377,14 +378,18 @@ async def get_stac_geoparquet_catalog(
             asset_href = f"{service_base_url}/data/geojson?parquet_url={parquet_url}&start_time={item_start_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z')}&end_time={item_end_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z')}"
             item.add_asset(
                 key="geojson_data",
-                asset=pystac.Asset(href=asset_href, media_type=pystac.MediaType.GEOJSON, roles=["data"])
+                asset=pystac.Asset(
+                    href=asset_href,
+                    media_type="application/geo+json",
+                    roles=["data"]
+                )
             )
             # The links property is part of the item itself, not a separate list to append.
             item.add_link(
                 pystac.Link(
                     rel="style",
                     target=style_url,
-                    media_type="text/cog-styles",
+                    media_type="application/json",
                     extra_fields={'asset:keys': ['geojson_data']}
                 )
             )
@@ -393,27 +398,58 @@ async def get_stac_geoparquet_catalog(
         # Convert STAC items to dictionaries
         item_dicts = [item.to_dict() for item in items]
 
+        # Manually process dictionaries to ensure all top-level STAC fields become columns
+        for item_dict in item_dicts:
+            # Promote 'properties' to the top level
+            properties = item_dict.pop('properties', {})
+            item_dict.update(properties)
+
+            # Convert 'bbox' array to a dictionary so Parquet writes it as a Struct
+            if 'bbox' in item_dict and isinstance(item_dict['bbox'], list):
+                b = item_dict['bbox']
+                if len(b) == 4:
+                    item_dict['bbox'] = {
+                        'xmin': b[0], 
+                        'ymin': b[1], 
+                        'xmax': b[2], 
+                        'ymax': b[3]
+                    }
+                elif len(b) == 6: # Fallback just in case you ever have 3D bounding boxes
+                    item_dict['bbox'] = {
+                        'xmin': b[0], 'ymin': b[1], 'zmin': b[2], 
+                        'xmax': b[3], 'ymax': b[4], 'zmax': b[5]
+                    }
+
         # Manually create the GeoDataFrame to ensure all STAC fields are included as columns.
-        # gpd.GeoDataFrame.from_features only extracts 'properties', 'id', and 'geometry'.
-        geometries = []
-        for item in item_dicts:
-            geom_dict = item.get('geometry')
-            # Only process the geometry if it's not None
-            geometries.append(shapely_geometry.shape(geom_dict) if geom_dict else None)
+        geometries = [
+            shapely_geometry.shape(item.get('geometry')) if item.get('geometry') else None
+            for item in item_dicts
+        ]
+        
         gdf = gpd.GeoDataFrame(item_dicts, geometry=geometries, crs="EPSG:4326")
 
-        # The 'geometry' from item_dicts is now redundant, so we can drop it.
-        gdf = gdf.drop(columns=['geometry'])
+        # Drop the original GeoJSON dict geometry from STAC to avoid serialization conflicts, 
+        # GeoPandas is now managing the active Shapely geometries.
+        if 'geometry' in gdf.columns:
+            gdf['geometry'] = geometries
 
-        # Convert complex columns to JSON strings for Parquet compatibility
-        for col in ['assets', 'links', 'stac_extensions']:
-             if col in gdf.columns:
-                gdf[col] = gdf[col].apply(json.dumps)
+        # Convert datetime column to a proper timestamp type for Parquet
+        gdf['datetime'] = pd.to_datetime(gdf['datetime'])
+
+        # --- WKB GEOMETRY HANDLING ---
+        # GeoPandas automatically serializes the active geometry to WKB when calling to_parquet().
+        # If you need strict GeoParquet compliance, do nothing else here.
+        #
+        # ONLY uncomment the line below if you want to bypass standard GeoParquet metadata 
+        # and force the column into raw bytes for a standard PyArrow Parquet file:
+        #
+        # gdf['geometry'] = gdf.geometry.to_wkb()
 
         # Write to an in-memory Parquet buffer
         buffer = io.BytesIO()
         gdf.to_parquet(buffer, index=False)
         buffer.seek(0)
+        
         return buffer.getvalue()
     except Exception as e:
         logger.error(f"Failed to generate STAC catalog for {parquet_url}. Error: {e}")
