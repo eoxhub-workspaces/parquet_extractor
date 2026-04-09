@@ -162,6 +162,10 @@ async def get_stac_catalog(
         # Construct the base URL of this service from the incoming request
         # This is needed to build the asset links in the STAC items.
         service_base_url = str(request.base_url).rstrip('/')
+
+        # Force https in production if the proxy messed up the scheme
+        if service_base_url.startswith("http://") and "localhost" not in service_base_url and "127.0.0.1" not in service_base_url:
+            service_base_url = service_base_url.replace("http://", "https://", 1)
         
         parquet_bytes = await get_stac_geoparquet_catalog(
             parquet_url=parquet_url,

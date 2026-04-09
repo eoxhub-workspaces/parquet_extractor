@@ -19,16 +19,14 @@ logger = logging.getLogger(__name__)
 def _construct_parquet_url(base_url: str, datetime_str: str) -> str:
     """
     Constructs the full S3 URL for the Parquet file based on the datetime string.
-    Example: base_url="...", datetime_str="2024-10-26T10:00:00Z" -> "..._2024_10.parquet"
+    Example: base_url="...", datetime_str="2025-11-01 00:46:18.481660160+00:00" -> "..._2025_11.parquet"
     """
     try:
-        # Handle ISO 8601 format, including 'Z' for UTC
-        dt_obj = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
-        year = dt_obj.year
-        month = dt_obj.month
-        # Format: base_url_YYYY_M.parquet
-        parquet_filename = f"{base_url}_{year}_{month}.parquet"
-        return parquet_filename
+        dt = pd.to_datetime(datetime_str)
+        year = dt.strftime("%Y")
+        month = str(dt.month)
+        day = dt.strftime("%d")
+        return f"{base_url}_{year}_{month}.parquet"
     except ValueError as e:
         logger.error(f"Invalid datetime string format: {datetime_str}. Error: {e}")
         raise ValueError(f"Invalid datetime string format: {datetime_str}. Expected ISO 8601 format (e.g., '2024-10-26T10:00:00Z').")
@@ -46,11 +44,11 @@ async def get_filtered_parquet_data(
     Fetches, filters, and returns data from a Parquet file on S3.
 
     Args:
-        datetime_str: A datetime string (e.g., "2024-10-26T10:00:00Z") to determine the Parquet file.
+        datetime_str: A datetime string (e.g., "2025-11-01 00:46:18.481660160+00:00") to determine the Parquet file.
         parent_cluster_id: The parent cluster ID to filter by.
         cluster_id: The cluster ID to filter by.
         earthcare_id: The EarthCARE ID to filter by.
-        parquet_base_url: The base URL for the Parquet files (e.g., "https://s3.waw4-1.cloudferro.com/EarthCODE/OSCAssets/storm-data/EC_lightning_GLM").
+        parquet_base_url: The base URL for the Parquet files.
         output_format: The desired output format ("json", "csv", or "geojson").
         columns_to_extract: An optional list of column names to extract.
 
@@ -66,7 +64,6 @@ async def get_filtered_parquet_data(
         source = parquet_url
         
         # Use s3fs for s3:// URLs or for http(s) URLs pointing to S3-compatible storage.
-        # Otherwise, let pyarrow handle the http(s) URL or local path directly.
         if parsed_url.scheme == 's3' or 's3' in parsed_url.netloc:
             endpoint_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
             source = parsed_url.path.lstrip('/')
@@ -75,11 +72,11 @@ async def get_filtered_parquet_data(
         else:
             logger.info(f"Using pyarrow's native handler for URL: '{source}'")
        
-        # Use the pyarrow.dataset API for more robust predicate pushdown.
+        # FIX: Pass 'source' as the first positional argument and define format
         dataset = ds.dataset(
-            s3_path,
             source,
             filesystem=filesystem,
+            format="parquet"
         )
         
         # Define the filter expression. This will be pushed down to the file scan.
@@ -95,17 +92,16 @@ async def get_filtered_parquet_data(
         downloaded_mb = table.nbytes / (1024 * 1024)
         
         logger.info(f"Successfully read and filtered Parquet file. Rows returned: {len(filtered_df)}, Data loaded: {downloaded_mb:.2f} MB")
+    
     except Exception as e:
         logger.error(f"Failed to read Parquet file from {parquet_url}. Error: {e}")
-        raise RuntimeError(f"Could not read Parquet file: {parquet_url}. Please check the URL and S3 bucket permissions. Error: {e}")
+        raise RuntimeError(f"Could not read Parquet file: {parquet_url}. Please check the URL and permissions. Error: {e}")
 
     if filtered_df.empty:
         logger.warning(f"No data found for parent_cluster_id={parent_cluster_id}, cluster_id={cluster_id}, earthcare_id='{earthcare_id}' in {parquet_url}")
         if output_format in ["json", "geojson"]:
             return "[]"
-        else: # csv
-            # For CSV, an empty string or just headers might be returned.
-            # Returning an empty string is simpler if no data.
+        else: 
             return ""
 
     def _sanitize_value(value, column_name):
@@ -113,26 +109,24 @@ async def get_filtered_parquet_data(
         if isinstance(value, bytes):
             if column_name == 'geometry':
                 try:
-                    # Decode WKB to a shapely geometry, then to a GeoJSON-like dict
                     return shapely_geometry.mapping(shapely.wkb.loads(value))
                 except Exception:
-                    # If it's not valid WKB, return a placeholder
                     return "invalid_geometry_data"
-            # For other byte columns, decode with replacement for bad characters
             return value.decode('utf-8', 'replace')
-        # If it's not bytes (e.g., already a string, number), just convert to string
         return str(value) if pd.notna(value) else None
 
     if output_format == "json":
-        # Sanitize object columns to prevent UTF-8 encoding errors with ujson
+        # Sanitize object columns to prevent UTF-8 encoding errors
         for col in filtered_df.select_dtypes(include=['object']).columns:
             filtered_df[col] = filtered_df[col].apply(lambda x: _sanitize_value(x, col))
         
         return filtered_df.to_json(orient="records", date_format="iso", force_ascii=False)
+    
     elif output_format == "csv":
         csv_buffer = io.StringIO()
         filtered_df.to_csv(csv_buffer, index=False)
         return csv_buffer.getvalue()
+    
     elif output_format == "geojson":
         features = []
         for _, row in filtered_df.iterrows():
@@ -148,7 +142,6 @@ async def get_filtered_parquet_data(
             else:
                 geometry = None
 
-            # Sanitize properties for JSON
             sanitized_properties = {k: _sanitize_value(v, k) for k, v in properties.items()}
 
             features.append({
@@ -159,6 +152,7 @@ async def get_filtered_parquet_data(
         
         feature_collection = {"type": "FeatureCollection", "features": features}
         return json.dumps(feature_collection)
+    
     else:
         raise ValueError(f"Unsupported output format: {output_format}. Must be 'json', 'csv', or 'geojson'.")
 
