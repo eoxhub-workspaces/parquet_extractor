@@ -38,7 +38,8 @@ async def get_filtered_parquet_data(
     earthcare_id: str,
     parquet_base_url: str,
     output_format: str = "json",
-    columns_to_extract: Optional[List[str]] = None
+    columns_to_extract: Optional[List[str]] = None,
+    exact_parquet_url: Optional[str] = None
 ) -> str:
     """
     Fetches, filters, and returns data from a Parquet file on S3.
@@ -51,12 +52,19 @@ async def get_filtered_parquet_data(
         parquet_base_url: The base URL for the Parquet files.
         output_format: The desired output format ("json", "csv", or "geojson").
         columns_to_extract: An optional list of column names to extract.
+        exact_parquet_url: If provided, bypasses URL construction and directly uses this URL.
 
     Returns:
         A string containing the filtered data in the specified format.
     """
-    parquet_url = _construct_parquet_url(parquet_base_url, datetime_str)
-    logger.info(f"Constructed Parquet URL: {parquet_url}")
+    # Check if the absolute URL was provided first
+    if exact_parquet_url:
+        parquet_url = exact_parquet_url
+        logger.info(f"Using explicitly provided Parquet URL: {parquet_url}")
+    else:
+        # Fall back to constructing it if no exact URL was given
+        parquet_url = _construct_parquet_url(parquet_base_url, datetime_str)
+        logger.info(f"Constructed Parquet URL: {parquet_url}")
 
     try:
         parsed_url = urlparse(parquet_url)
@@ -80,11 +88,24 @@ async def get_filtered_parquet_data(
         )
         
         # Define the filter expression. This will be pushed down to the file scan.
-        filter_expression = (
+        if parent_cluster_id == -1:
+            filter_expression = (
             (ds.field('earthcare_id') == earthcare_id) &
-            (ds.field('parent_cluster_id') == parent_cluster_id) & 
             (ds.field('cluster_id') == cluster_id)
         )
+        else:
+            filter_expression = (
+                (ds.field('earthcare_id') == earthcare_id) &
+                (ds.field('parent_cluster_id') == parent_cluster_id) & 
+                (ds.field('cluster_id') == cluster_id)
+            )
+        # Safeguard: Expand any comma-separated strings in the columns list
+        if columns_to_extract:
+            expanded_columns = []
+            for item in columns_to_extract:
+                # Split by comma and strip any accidental whitespace
+                expanded_columns.extend([col.strip() for col in item.split(',')])
+            columns_to_extract = expanded_columns
         
         table = dataset.to_table(filter=filter_expression, columns=columns_to_extract)
         filtered_df = table.to_pandas()

@@ -47,6 +47,11 @@ async def get_parquet_data(
         alias="columns_to_extract",
         description="Optional list of column names to extract."
     ),
+    exact_parquet_url: Optional[str] = Query(
+        None, 
+        alias="exact_parquet_url",
+        description="Optional absolute url to parquet which will be used and overwritten instead of creating one using parquet_base_url"
+    ),
     output_format: str = Query(
         "json",
         description="Desired output format: 'json', 'csv', or 'geojson'.",
@@ -66,7 +71,8 @@ async def get_parquet_data(
             earthcare_id=earthcare_id,
             parquet_base_url=parquet_base_url,
             output_format=output_format,
-            columns_to_extract=columns
+            columns_to_extract=columns,
+            exact_parquet_url=exact_parquet_url
         )
 
         if output_format in ["json", "geojson"]:
