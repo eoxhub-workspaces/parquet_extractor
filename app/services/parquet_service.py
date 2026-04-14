@@ -370,15 +370,20 @@ async def get_stac_geoparquet_catalog(
         end_dt = max(parsed_max_dates)
 
         items = []
-        # Generate monthly STAC Items
-        for dt in pd.date_range(start_dt.replace(day=1), end_dt, freq='MS'):
-            # Set time to midnight UTC for start of month
-            item_start_time = dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-            # Set time to midnight UTC for end of month (start of next month)
-            item_end_time = (dt + pd.offsets.MonthEnd(1)).to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+        # Generate yearly STAC Items, anchored to the latest data point and going backwards.
+        current_end = end_dt.to_pydatetime().replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
+        
+        while current_end > start_dt.to_pydatetime().replace(tzinfo=timezone.utc):
+            # The start of the current yearly group is one year before its end.
+            current_start = current_end - pd.DateOffset(years=1)
+
+            # Ensure the group's start doesn't go past the beginning of the dataset.
+            item_start_time = max(current_start, start_dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc))
+            item_end_time = current_end
+
             geom = box(-180, -90, 180, 90)
             item = pystac.Item(
-                id=f"month-{dt.year}-{dt.month:02d}",
+                id=f"year-{item_end_time.year}",
                 geometry=geom,
                 bbox=list(geom.bounds),
                 datetime=item_start_time,
@@ -409,6 +414,9 @@ async def get_stac_geoparquet_catalog(
                 )
             )
             items.append(item)
+
+            # Move to the previous year for the next item.
+            current_end = current_start
 
         # Convert STAC items to dictionaries
         item_dicts = [item.to_dict() for item in items]
