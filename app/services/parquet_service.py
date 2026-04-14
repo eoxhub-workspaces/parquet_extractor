@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import io
 import logging
 import pyarrow.parquet as pq
+from dateutil.parser import parse as dateutil_parse
 import pyarrow.dataset as ds
 from typing import Optional, List
 import json
@@ -363,8 +364,8 @@ async def get_stac_geoparquet_catalog(
 
         # The dates from metadata can be strings, so they need to be parsed.
         # We also need to handle cases where they might already be datetime objects.
-        parsed_min_dates = [datetime.fromisoformat(d.replace('Z', '+00:00')) if isinstance(d, str) else d for d in all_min]
-        parsed_max_dates = [datetime.fromisoformat(d.replace('Z', '+00:00')) if isinstance(d, str) else d for d in all_max]
+        parsed_min_dates = [dateutil_parse(d) if isinstance(d, str) else d for d in all_min]
+        parsed_max_dates = [dateutil_parse(d) if isinstance(d, str) else d for d in all_max]
 
         start_dt = min(parsed_min_dates)
         end_dt = max(parsed_max_dates)
@@ -457,7 +458,7 @@ async def get_stac_geoparquet_catalog(
             gdf['geometry'] = geometries
 
         # Convert datetime column to a proper timestamp type for Parquet
-        gdf['datetime'] = pd.to_datetime(gdf['datetime'])
+        gdf['datetime'] = pd.to_datetime(gdf['datetime'], format='ISO8601')
 
         # --- WKB GEOMETRY HANDLING ---
         # GeoPandas automatically serializes the active geometry to WKB when calling to_parquet().
