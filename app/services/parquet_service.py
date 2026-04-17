@@ -370,7 +370,6 @@ def get_parquet_metadata(
         inspect = columns_to_inspect if columns_to_inspect else all_columns
 
         # --- Row-group metadata ---
-        # parquet_metadata() returns one row per column chunk per row group.
         meta_df = con.execute(
             f"SELECT * FROM parquet_metadata('{parquet_url}')"
         ).df()
@@ -388,6 +387,12 @@ def get_parquet_metadata(
             "num_row_groups": num_row_groups,
             "schema": schema_str,
         }
+        
+        # HELPER: Converts NumPy/Pandas scalars to native Python types for JSON serialization
+        def to_native(val):
+            if pd.isna(val):
+                return None
+            return val.item() if hasattr(val, "item") else val
 
         # Per-row-group stats
         row_groups_stats = []
@@ -408,9 +413,12 @@ def get_parquet_metadata(
                     col_info["status"] = "Not found in row group metadata"
                 else:
                     r = col_rows.iloc[0]
-                    stats_min = r.get("stats_min_value") or r.get("stats_min")
-                    stats_max = r.get("stats_max_value") or r.get("stats_max")
-                    null_count = r.get("null_count", None)
+                    
+                    # Apply the helper here to strip away numpy.int64, pd.NA, etc.
+                    stats_min = to_native(r.get("stats_min_value") or r.get("stats_min"))
+                    stats_max = to_native(r.get("stats_max_value") or r.get("stats_max"))
+                    null_count = to_native(r.get("null_count"))
+                    num_values = to_native(r.get("num_values"))
 
                     if stats_min is not None or stats_max is not None:
                         col_info["statistics"] = {
@@ -418,7 +426,7 @@ def get_parquet_metadata(
                             "max": stats_max,
                             "has_nulls": bool(null_count) if null_count is not None else None,
                             "null_count": null_count,
-                            "num_values": r.get("num_values", None),
+                            "num_values": num_values,
                         }
                     else:
                         col_info["status"] = "No statistics available"
@@ -436,7 +444,6 @@ def get_parquet_metadata(
         raise RuntimeError(
             f"An error occurred while inspecting Parquet metadata: {e}"
         )
-
 
 async def get_stac_geoparquet_catalog(
     parquet_url: str,
