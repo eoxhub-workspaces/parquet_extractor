@@ -1,3 +1,6 @@
+import os
+# Force a writable home directory for DuckDB
+os.environ["HOME"] = "/tmp"
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import Optional, List
