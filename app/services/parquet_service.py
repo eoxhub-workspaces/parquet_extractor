@@ -8,12 +8,15 @@ import pyarrow.dataset as ds
 from typing import Optional, List
 import json
 import geopandas as gpd
-from shapely.geometry import box
+from shapely.geometry import box, Point
+from geopandas.array import to_wkb
 import pystac
 import s3fs
 import shapely.wkb
 import shapely.geometry as shapely_geometry
+import requests
 from urllib.parse import urlparse
+import duckdb
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,94 @@ def _construct_parquet_url(base_url: str, datetime_str: str) -> str:
         logger.error(f"Invalid datetime string format: {datetime_str}. Error: {e}")
         raise ValueError(f"Invalid datetime string format: {datetime_str}. Expected ISO 8601 format (e.g., '2024-10-26T10:00:00Z').")
 
+def _configure_duckdb_for_url(con: duckdb.DuckDBPyConnection, parquet_url: str) -> None:
+    """
+    Installs/loads the httpfs extension and configures S3 credentials
+    based on the URL scheme.
+    """
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+
+    parsed = urlparse(parquet_url)
+
+    if parsed.scheme == "s3" or "s3" in parsed.netloc:
+        # Anonymous access — mirrors s3fs.S3FileSystem(anon=True)
+        con.execute("SET s3_use_ssl = true;")
+        con.execute("SET s3_url_style = 'path';")
+
+        # If it's an S3-compatible endpoint (not native AWS), extract and set it
+        if parsed.scheme in ("http", "https") and "s3" in parsed.netloc:
+            endpoint = parsed.netloc
+            con.execute(f"SET s3_endpoint = '{endpoint}';")
+
+        # Force anonymous (no credentials)
+        con.execute("SET s3_access_key_id = '';")
+        con.execute("SET s3_secret_access_key = '';")
+
+    elif parsed.scheme in ("http", "https"):
+        # Plain HTTP/HTTPS — httpfs handles this natively, no extra config needed
+        pass
+
+
+def _build_filter_clause(
+    earthcare_id: str,
+    parent_cluster_id: int,
+    cluster_id: int,
+) -> str:
+    """Builds the SQL WHERE clause string."""
+    clauses = [
+        f"earthcare_id = '{earthcare_id}'",
+        f"cluster_id = {cluster_id}",
+    ]
+    if parent_cluster_id != -1:
+        clauses.append(f"parent_cluster_id = {parent_cluster_id}")
+    return " AND ".join(clauses)
+
+
+def _resolve_columns(
+    con: duckdb.DuckDBPyConnection,
+    parquet_url: str,
+    columns_to_extract: Optional[List[str]],
+) -> Optional[List[str]]:
+    """
+    Expands comma-separated column strings and only appends coordinate
+    columns that actually exist in the remote Parquet schema.
+    """
+    # Fetch the real schema without downloading data
+    available_columns = {
+        row[0]
+        for row in con.execute(
+            f"SELECT name FROM parquet_schema('{parquet_url}')"
+        ).fetchall()
+    }
+    logger.info(f"Remote schema has columns: {available_columns}")
+
+    if not columns_to_extract:
+        return None
+
+    # Expand comma-separated strings
+    expanded = []
+    for item in columns_to_extract:
+        expanded.extend([col.strip() for col in item.split(",")])
+
+    # Only append coordinate columns that exist in the file
+    required_coords = [
+        "parallax_corrected_lon",
+        "parallax_corrected_lat",
+        "longitude",
+        "latitude",
+    ]
+    for coord in required_coords:
+        if coord not in expanded and coord in available_columns:
+            expanded.append(coord)
+
+    # Warn about any user-requested columns that are missing
+    missing = [col for col in expanded if col not in available_columns]
+    if missing:
+        logger.warning(f"Requested columns not found in schema, dropping: {missing}")
+        expanded = [col for col in expanded if col in available_columns]
+
+    return expanded
+
 async def get_filtered_parquet_data(
     datetime_str: str,
     parent_cluster_id: int,
@@ -40,8 +131,118 @@ async def get_filtered_parquet_data(
     parquet_base_url: str,
     output_format: str = "json",
     columns_to_extract: Optional[List[str]] = None,
-    exact_parquet_url: Optional[str] = None
+    exact_parquet_url: Optional[str] = None,
 ) -> str:
+    """
+    Fetches, filters, and returns data from a Parquet file using DuckDB.
+    DuckDB issues HTTP range requests so only matching row groups are
+    downloaded, rather than the entire file.
+
+    Args:
+        datetime_str: A datetime string to determine the Parquet file.
+        parent_cluster_id: The parent cluster ID to filter by (-1 to skip).
+        cluster_id: The cluster ID to filter by.
+        earthcare_id: The EarthCARE ID to filter by.
+        parquet_base_url: The base URL for the Parquet files.
+        output_format: Desired output format — "json", "csv", or "geojson".
+        columns_to_extract: Optional list of column names to extract.
+        exact_parquet_url: If provided, bypasses URL construction.
+
+    Returns:
+        A string containing the filtered data in the specified format.
+    """
+    # --- Resolve URL ---
+    if exact_parquet_url:
+        parquet_url = exact_parquet_url
+        logger.info(f"Using explicitly provided Parquet URL: {parquet_url}")
+    else:
+        parquet_url = _construct_parquet_url(parquet_base_url, datetime_str)
+        logger.info(f"Constructed Parquet URL: {parquet_url}")
+
+    # --- Execute via DuckDB ---
+    try:
+        con = duckdb.connect()
+        _configure_duckdb_for_url(con, parquet_url)
+
+        # Schema check happens on the open connection, before building the query
+        resolved_columns = _resolve_columns(con, parquet_url, columns_to_extract)
+        select_clause = ", ".join(resolved_columns) if resolved_columns else "*"
+        where_clause = _build_filter_clause(earthcare_id, parent_cluster_id, cluster_id)
+
+        query = f"""
+            SELECT {select_clause}
+            FROM read_parquet('{parquet_url}')
+            WHERE {where_clause}
+        """
+
+        logger.info(f"Executing DuckDB query against: {parquet_url}")
+        filtered_df = con.execute(query).df()
+        con.close()
+
+        downloaded_approx_mb = filtered_df.memory_usage(deep=True).sum() / (1024 * 1024)
+        logger.info(
+            f"Query complete. Rows returned: {len(filtered_df)}, "
+            f"Result size: {downloaded_approx_mb:.2f} MB"
+        )
+
+    except Exception as e:
+        logger.error(f"DuckDB failed to read {parquet_url}. Error: {e}")
+        raise RuntimeError(
+            f"Could not read Parquet file: {parquet_url}. "
+            f"Please check the URL and permissions. Error: {e}"
+        )
+
+    # --- Empty result ---
+    if filtered_df.empty:
+        logger.warning(
+            f"No data found for parent_cluster_id={parent_cluster_id}, "
+            f"cluster_id={cluster_id}, earthcare_id='{earthcare_id}' in {parquet_url}"
+        )
+        return "[]" if output_format in ("json", "geojson") else ""
+
+    # --- Geometry construction (mirrors original logic) ---
+    if (
+        "parallax_corrected_lon" in filtered_df.columns
+        and "parallax_corrected_lat" in filtered_df.columns
+    ):
+        logger.info("Creating geometry from parallax corrected coordinates.")
+        geometries = gpd.points_from_xy(
+            filtered_df["parallax_corrected_lon"],
+            filtered_df["parallax_corrected_lat"],
+        )
+        filtered_df["geometry"] = to_wkb(geometries)
+
+    elif "longitude" in filtered_df.columns and "latitude" in filtered_df.columns:
+        logger.info("Creating geometry from standard latitude/longitude.")
+        geometries = gpd.points_from_xy(
+            filtered_df["longitude"], filtered_df["latitude"]
+        )
+        filtered_df["geometry"] = to_wkb(geometries)
+
+    # --- Serialise output (mirrors original caller expectations) ---
+    if output_format == "json":
+        return filtered_df.to_json(orient="records")
+
+    elif output_format == "csv":
+        return filtered_df.to_csv(index=False)
+
+    elif output_format == "geojson":
+        if "geometry" not in filtered_df.columns:
+            logger.warning("GeoJSON requested but no geometry column was created.")
+            return filtered_df.to_json(orient="records")
+
+        gdf = gpd.GeoDataFrame(
+            filtered_df,
+            geometry=gpd.GeoSeries.from_wkb(
+                filtered_df["geometry"].apply(
+                    lambda g: bytes(g) if isinstance(g, bytearray) else g
+                )
+            ),
+        )
+        return gdf.to_json()
+
+    else:
+        raise ValueError(f"Unsupported output_format: '{output_format}'. Use 'json', 'csv', or 'geojson'.")
     """
     Fetches, filters, and returns data from a Parquet file on S3.
 
@@ -67,17 +268,35 @@ async def get_filtered_parquet_data(
         parquet_url = _construct_parquet_url(parquet_base_url, datetime_str)
         logger.info(f"Constructed Parquet URL: {parquet_url}")
 
+    # Resolve redirects for HTTP/HTTPS URLs
+    if parquet_url.startswith(('http://', 'https://')):
+        try:
+            logger.info(f"Resolving potential redirects for {parquet_url}")
+            response = requests.head(parquet_url, allow_redirects=True, timeout=10)
+            final_url = response.url
+            if final_url != parquet_url:
+                logger.info(f"Redirect resolved. Original URL: {parquet_url}, Final URL: {final_url}")
+                parquet_url = final_url
+        except requests.RequestException as e:
+            logger.error(f"Failed to resolve URL {parquet_url}. Error: {e}")
+            raise RuntimeError(f"Could not resolve URL: {parquet_url}. Error: {e}")
+
     try:
         parsed_url = urlparse(parquet_url)
         filesystem = None
         source = parquet_url
         
-        # Use s3fs for s3:// URLs or for http(s) URLs pointing to S3-compatible storage.
-        if parsed_url.scheme == 's3' or 's3' in parsed_url.netloc:
-            endpoint_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            source = parsed_url.path.lstrip('/')
-            filesystem = s3fs.S3FileSystem(anon=True, client_kwargs={'endpoint_url': endpoint_url})
-            logger.info(f"Using s3fs for path: '{source}' at endpoint: '{endpoint_url}'")
+        # Use s3fs for s3:// URLs or for http(s) URLs that look like S3 pre-signed URLs.
+        is_s3_like = (
+            parsed_url.scheme == 's3' or
+            's3' in parsed_url.netloc or
+            'X-Amz-Algorithm' in parsed_url.query
+        )
+        if is_s3_like:
+            # For pre-signed URLs, s3fs can handle them directly.
+            # We don't need to manually split the URL.
+            filesystem = s3fs.S3FileSystem(anon=True)
+            logger.info(f"Using s3fs for S3-like URL: '{source}'")
         else:
             logger.info(f"Using pyarrow's native handler for URL: '{source}'")
        
@@ -108,11 +327,30 @@ async def get_filtered_parquet_data(
                 expanded_columns.extend([col.strip() for col in item.split(',')])
             columns_to_extract = expanded_columns
         
+        # Add coordinate columns to extraction list if they are not already present,
+        # as they are needed for potential geometry creation.
+        if columns_to_extract:
+            required_coords = ['parallax_corrected_lon', 'parallax_corrected_lat', 'longitude', 'latitude']
+            for coord in required_coords:
+                if coord not in columns_to_extract:
+                    columns_to_extract.append(coord)
+
         table = dataset.to_table(filter=filter_expression, columns=columns_to_extract)
         filtered_df = table.to_pandas()
 
         downloaded_mb = table.nbytes / (1024 * 1024)
         
+        # Check for coordinate columns to create Point geometry, overriding existing geometry.
+        if 'parallax_corrected_lon' in filtered_df.columns and 'parallax_corrected_lat' in filtered_df.columns:
+            logger.info("Creating geometry from parallax corrected coordinates.")
+            geometries = gpd.points_from_xy(filtered_df['parallax_corrected_lon'], filtered_df['parallax_corrected_lat'])
+            filtered_df['geometry'] = to_wkb(geometries)
+
+        elif 'longitude' in filtered_df.columns and 'latitude' in filtered_df.columns:
+            logger.info("Creating geometry from standard latitude/longitude.")
+            geometries = gpd.points_from_xy(filtered_df['longitude'], filtered_df['latitude'])
+            filtered_df['geometry'] = to_wkb(geometries)
+
         logger.info(f"Successfully read and filtered Parquet file. Rows returned: {len(filtered_df)}, Data loaded: {downloaded_mb:.2f} MB")
     
     except Exception as e:
@@ -375,8 +613,8 @@ async def get_stac_geoparquet_catalog(
         current_end = end_dt.to_pydatetime().replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
         
         while current_end > start_dt.to_pydatetime().replace(tzinfo=timezone.utc):
-            # The start of the current yearly group is one year before its end.
-            current_start = current_end - pd.DateOffset(years=1)
+            # The start of the current half yearly group is half year before its end.
+            current_start = current_end - pd.DateOffset(months=6)
 
             # Ensure the group's start doesn't go past the beginning of the dataset.
             item_start_time = max(current_start, start_dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc))
@@ -384,7 +622,7 @@ async def get_stac_geoparquet_catalog(
 
             geom = box(-180, -90, 180, 90)
             item = pystac.Item(
-                id=f"year-{item_end_time.year}",
+                id=f"{item_end_time.year}-{item_end_time.month}",
                 geometry=geom,
                 bbox=list(geom.bounds),
                 datetime=item_start_time,
