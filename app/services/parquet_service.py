@@ -1,11 +1,14 @@
 import pandas as pd
 from datetime import datetime, timezone
 import io
+import asyncio
 import logging
 import duckdb
 from dateutil.parser import parse as dateutil_parse
-from typing import Optional, List
+from typing import Optional, List, Callable, Any
 import json
+from functools import wraps
+from cachetools import TTLCache
 import geopandas as gpd
 from shapely.geometry import box
 from geopandas.array import to_wkb
@@ -16,6 +19,42 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Caching Layer
+# ---------------------------------------------------------------------------
+
+# Cache with a TTL of 24 hours (86400 seconds) and a max size of 500 entries.
+api_cache = TTLCache(maxsize=500, ttl=86400)
+cache_lock = asyncio.Lock()
+
+def async_ttl_cache(func: Callable) -> Callable:
+    """
+    A decorator for caching the results of async functions.
+    It uses a TTLCache and an asyncio.Lock to prevent race conditions.
+    """
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        # Create a cache key from the function's arguments.
+        # Convert mutable types like lists to tuples to make them hashable.
+        key_args = [
+            tuple(arg) if isinstance(arg, list) else arg for arg in args
+        ]
+        key_kwargs = {
+            k: tuple(v) if isinstance(v, list) else v for k, v in kwargs.items()
+        }
+        cache_key = (func.__name__, tuple(key_args), frozenset(key_kwargs.items()))
+
+        async with cache_lock:
+            if cache_key in api_cache:
+                logger.info(f"Cache hit for {func.__name__} with key: {cache_key}")
+                return api_cache[cache_key]
+
+        # If not in cache, execute the function and store the result.
+        result = await func(*args, **kwargs)
+        async with cache_lock:
+            api_cache[cache_key] = result
+        return result
+    return wrapper
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -218,6 +257,7 @@ def _serialise(filtered_df: pd.DataFrame, output_format: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+@async_ttl_cache
 async def get_filtered_parquet_data(
     datetime_str: str,
     parent_cluster_id: int,
@@ -277,6 +317,7 @@ async def get_filtered_parquet_data(
     return _serialise(filtered_df, output_format)
 
 
+@async_ttl_cache
 async def get_geojson_from_parquet_url(
     parquet_url: str,
     start_time: str,
