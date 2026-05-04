@@ -8,6 +8,7 @@ from dateutil.parser import parse as dateutil_parse
 from typing import Optional, List, Callable, Any
 import json
 from functools import wraps
+import functools
 from cachetools import TTLCache
 import geopandas as gpd
 from shapely.geometry import box
@@ -46,8 +47,10 @@ def async_ttl_cache(func: Callable) -> Callable:
 
         async with cache_lock:
             if cache_key in api_cache:
-                logger.info(f"Cache hit for {func.__name__} with key: {cache_key}")
+                logger.info(f"Cache hit for {func.__name__}.")
                 return api_cache[cache_key]
+
+        logger.info(f"Cache miss for {func.__name__}. Fetching fresh data.")
 
         # If not in cache, execute the function and store the result.
         result = await func(*args, **kwargs)
@@ -99,12 +102,11 @@ def _configure_duckdb_for_url(con: duckdb.DuckDBPyConnection, parquet_url: str) 
         con.execute("SET s3_secret_access_key = '';")
 
 
-def _open_duckdb(parquet_url: str) -> duckdb.DuckDBPyConnection:
+def _open_duckdb_sync(parquet_url: str) -> duckdb.DuckDBPyConnection:
     """Opens a fresh DuckDB connection configured for the given URL."""
     con = duckdb.connect()
     _configure_duckdb_for_url(con, parquet_url)
     return con
-
 
 def _build_filter_clause(
     earthcare_id: str,
@@ -121,7 +123,7 @@ def _build_filter_clause(
     return " AND ".join(clauses)
 
 
-def _resolve_columns(
+async def _resolve_columns(
     con: duckdb.DuckDBPyConnection,
     parquet_url: str,
     columns_to_extract: Optional[List[str]],
@@ -131,10 +133,9 @@ def _resolve_columns(
     columns that actually exist in the remote Parquet schema.
     """
     available_columns = {
-        row[0]
-        for row in con.execute(
-            f"SELECT name FROM parquet_schema('{parquet_url}')"
-        ).fetchall()
+        row[0] for row in await asyncio.to_thread(
+            lambda: con.execute(f"SELECT name FROM parquet_schema('{parquet_url}')").fetchall()
+        )
     }
     logger.info(f"Remote schema columns: {available_columns}")
 
@@ -281,8 +282,8 @@ async def get_filtered_parquet_data(
     logger.info(f"Parquet URL: {parquet_url}")
 
     try:
-        con = _open_duckdb(parquet_url)
-        resolved_columns = _resolve_columns(con, parquet_url, columns_to_extract)
+        con = await asyncio.to_thread(_open_duckdb_sync, parquet_url)
+        resolved_columns = await _resolve_columns(con, parquet_url, columns_to_extract)
         select_clause = ", ".join(resolved_columns) if resolved_columns else "*"
         where_clause = _build_filter_clause(earthcare_id, parent_cluster_id, cluster_id)
 
@@ -291,9 +292,9 @@ async def get_filtered_parquet_data(
             FROM read_parquet('{parquet_url}')
             WHERE {where_clause}
         """
-        logger.info(f"Executing query: {query}")
-        filtered_df = con.execute(query).df()
-        con.close()
+        logger.debug(f"Executing query: {query}")
+        filtered_df = await asyncio.to_thread(lambda: con.execute(query).df())
+        await asyncio.to_thread(con.close)
 
         logger.info(
             f"Query complete. Rows: {len(filtered_df)}, "
@@ -336,14 +337,13 @@ async def get_geojson_from_parquet_url(
     select_clause = ", ".join(columns_to_extract) if columns_to_extract else "*"
 
     try:
-        con = _open_duckdb(parquet_url)
+        con = await asyncio.to_thread(_open_duckdb_sync, parquet_url)
 
         # Validate that peak_datetime actually exists before filtering on it
         available = {
-            row[0]
-            for row in con.execute(
-                f"SELECT name FROM parquet_schema('{parquet_url}')"
-            ).fetchall()
+            row[0] for row in await asyncio.to_thread(lambda:
+                con.execute(f"SELECT name FROM parquet_schema('{parquet_url}')").fetchall()
+            )
         }
         if "peak_datetime" not in available:
             raise ValueError(
@@ -357,9 +357,9 @@ async def get_geojson_from_parquet_url(
             WHERE peak_datetime >= TIMESTAMPTZ '{start_time}'
               AND peak_datetime <  TIMESTAMPTZ '{end_time}'
         """
-        logger.info(f"Executing query: {query}")
-        df = con.execute(query).df()
-        con.close()
+        logger.debug(f"Executing query: {query}")
+        df = await asyncio.to_thread(lambda: con.execute(query).df())
+        await asyncio.to_thread(con.close)
 
     except Exception as e:
         logger.error(f"Failed to read/filter {parquet_url}. Error: {e}")
@@ -390,7 +390,8 @@ async def get_geojson_from_parquet_url(
     return json.dumps({"type": "FeatureCollection", "features": features})
 
 
-def get_parquet_metadata(
+@async_ttl_cache
+async def get_parquet_metadata(
     parquet_url: str,
     columns_to_inspect: Optional[List[str]] = None,
 ) -> dict:
@@ -399,22 +400,22 @@ def get_parquet_metadata(
     Uses parquet_schema() for column info and parquet_metadata() for row-group stats.
     """
     try:
-        con = _open_duckdb(parquet_url)
+        con = await asyncio.to_thread(_open_duckdb_sync, parquet_url)
 
         # --- Schema ---
-        schema_rows = con.execute(
-            f"SELECT name, logical_type FROM parquet_schema('{parquet_url}')"
-        ).fetchall()
+        schema_rows = await asyncio.to_thread(
+            lambda: con.execute(f"SELECT name, logical_type FROM parquet_schema('{parquet_url}')").fetchall()
+        )
         all_columns = [row[0] for row in schema_rows]
         schema_str = "\n".join(f"{row[0]}: {row[1]}" for row in schema_rows)
 
         inspect = columns_to_inspect if columns_to_inspect else all_columns
 
         # --- Row-group metadata ---
-        meta_df = con.execute(
-            f"SELECT * FROM parquet_metadata('{parquet_url}')"
-        ).df()
-        con.close()
+        meta_df = await asyncio.to_thread(
+            lambda: con.execute(f"SELECT * FROM parquet_metadata('{parquet_url}')").df()
+        )
+        await asyncio.to_thread(con.close)
 
         # Basic file-level info
         num_row_groups = int(meta_df["row_group_id"].max()) + 1 if not meta_df.empty else 0
@@ -486,6 +487,7 @@ def get_parquet_metadata(
             f"An error occurred while inspecting Parquet metadata: {e}"
         )
 
+@async_ttl_cache
 async def get_stac_geoparquet_catalog(
     parquet_url: str,
     service_base_url: str,
@@ -494,7 +496,7 @@ async def get_stac_geoparquet_catalog(
     Generates an items GeoParquet for monthly items based on the provided parquet.
     """
     try:
-        metadata = get_parquet_metadata(parquet_url, columns_to_inspect=["peak_datetime"])
+        metadata = await get_parquet_metadata(parquet_url, columns_to_inspect=["peak_datetime"])
         style_url = "https://workspace-ui-public.gtif-austria.hub-otc.eox.at/api/public/share/public-4wazei3y-02/assets/stormtracker_style.json"
 
         all_min, all_max = [], []
