@@ -188,6 +188,10 @@ async def get_stac_catalog(
     style_url: str = Query(
         "https://workspace-ui-public.gtif-austria.hub-otc.eox.at/api/public/share/public-4wazei3y-02/assets/stormtracker_style.json",
         description="The style file URL to be returned in the geoparquet/STAC item link."
+    ),
+    split: bool = Query(
+        True,
+        description="Whether to split the temporal range into multiple intervals (6-month increments), or return a single unsplit catalog item."
     )
 ):
     """
@@ -207,7 +211,8 @@ async def get_stac_catalog(
         parquet_bytes = await get_stac_geoparquet_catalog(
             parquet_url=parquet_url,
             service_base_url=service_base_url,
-            style_url=style_url
+            style_url=style_url,
+            split=split
         )
         
         # Return the generated Parquet file as a streaming response

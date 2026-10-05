@@ -576,6 +576,7 @@ async def get_stac_geoparquet_catalog(
     parquet_url: str,
     service_base_url: str,
     style_url: str = "https://workspace-ui-public.gtif-austria.hub-otc.eox.at/api/public/share/public-4wazei3y-02/assets/stormtracker_style.json",
+    split: bool = True,
 ) -> bytes:
     """
     Generates an items GeoParquet for monthly items based on the provided parquet.
@@ -599,23 +600,19 @@ async def get_stac_geoparquet_catalog(
         end_dt = max(parsed_max)
 
         items = []
-        current_end = end_dt.replace(
-            hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
-        )
 
-        while current_end > start_dt.replace(tzinfo=timezone.utc):
-            current_start = current_end - pd.DateOffset(months=6)
-            item_start_time = max(
-                current_start,
-                start_dt.replace(
-                    hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
-                ),
+        if not split:
+            # Create a single STAC item spanning the entire temporal range (no splitting)
+            item_start_time = start_dt.replace(
+                hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
             )
-            item_end_time = current_end
+            item_end_time = end_dt.replace(
+                hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+            )
 
             geom = box(-180, -90, 180, 90)
             item = pystac.Item(
-                id=f"{item_end_time.year}-{item_end_time.month}",
+                id=f"{item_start_time.year}_{item_start_time.month}-{item_end_time.year}_{item_end_time.month}",
                 geometry=geom,
                 bbox=list(geom.bounds),
                 datetime=item_start_time,
@@ -648,7 +645,58 @@ async def get_stac_geoparquet_catalog(
                 )
             )
             items.append(item)
-            current_end = current_start
+        else:
+            # Standard 6-month interval splitting
+            current_end = end_dt.replace(
+                hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+            )
+
+            while current_end > start_dt.replace(tzinfo=timezone.utc):
+                current_start = current_end - pd.DateOffset(months=6)
+                item_start_time = max(
+                    current_start,
+                    start_dt.replace(
+                        hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+                    ),
+                )
+                item_end_time = current_end
+
+                geom = box(-180, -90, 180, 90)
+                item = pystac.Item(
+                    id=f"{item_end_time.year}-{item_end_time.month}",
+                    geometry=geom,
+                    bbox=list(geom.bounds),
+                    datetime=item_start_time,
+                    properties={
+                        "start_datetime": item_start_time.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                        "end_datetime": item_end_time.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    },
+                )
+
+                asset_href = (
+                    f"{service_base_url}/data/geojson"
+                    f"?parquet_url={parquet_url}"
+                    f"&start_time={item_start_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z')}"
+                    f"&end_time={item_end_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z')}"
+                )
+                item.add_asset(
+                    key="geojson_data",
+                    asset=pystac.Asset(
+                        href=asset_href,
+                        media_type="application/geo+json",
+                        roles=["data"],
+                    ),
+                )
+                item.add_link(
+                    pystac.Link(
+                        rel="style",
+                        target=style_url,
+                        media_type="application/json",
+                        extra_fields={"asset:keys": ["geojson_data"]},
+                    )
+                )
+                items.append(item)
+                current_end = current_start
 
         item_dicts = [item.to_dict() for item in items]
         for item_dict in item_dicts:

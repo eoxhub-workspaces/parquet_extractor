@@ -335,28 +335,30 @@ class TestFastAPIRoutes(unittest.IsolatedAsyncioTestCase):
         )
 
     @patch("app.main.get_stac_geoparquet_catalog")
-    async def test_stac_catalog_endpoint_passes_style_url(self, mock_get_stac_geoparquet_catalog):
+    async def test_stac_catalog_endpoint_passes_parameters(self, mock_get_stac_geoparquet_catalog):
         mock_get_stac_geoparquet_catalog.return_value = b"mock_parquet_bytes"
 
         # Mock the FastAPI request object
         mock_request = MagicMock()
         mock_request.base_url = "http://localhost:8000"
 
-        # Call get_stac_catalog directly with a custom style_url
+        # Call get_stac_catalog directly with custom parameters
         response = await get_stac_catalog(
             request=mock_request,
             parquet_url="s3://dummy/file.parquet",
-            style_url="https://example.com/custom_style.json"
+            style_url="https://example.com/custom_style.json",
+            split=False
         )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.media_type, "application/x-parquet")
 
-        # Verify that get_stac_geoparquet_catalog was called with the custom style_url!
+        # Verify that get_stac_geoparquet_catalog was called with the custom parameters!
         mock_get_stac_geoparquet_catalog.assert_called_once_with(
             parquet_url="s3://dummy/file.parquet",
             service_base_url="http://localhost:8000",
-            style_url="https://example.com/custom_style.json"
+            style_url="https://example.com/custom_style.json",
+            split=False
         )
 
 if __name__ == '__main__':

@@ -38,6 +38,16 @@ The `/data/geojson` endpoint supports dynamic, server-side filtering. Filters ar
 | `surface_type` | `str` | `"all"` | Categorical filter (`"all"`, `"land"`, or `"water"`) |
 | `earthcare_id`| `str` | `""` | Optional filter match on EarthCARE ID |
 
+### STAC/GeoParquet Catalog Parameters
+
+The `/stac/geoparquet` endpoint generates SpatioTemporal Asset Catalogs with optional customization:
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `parquet_url` | `str` | *(Required)* | The absolute URL of the Parquet file to catalog |
+| `style_url` | `str` | `"https://workspace-ui-public.gtif-austria.hub-otc.eox.at/api/public/share/public-4wazei3y-02/assets/stormtracker_style.json"` | Custom styling JSON URL returned in the catalog link assets |
+| `split` | `bool` | `true` | If `true`, splits the temporal range into multiple 6-month interval items. If `false`, returns a single unsplit catalog item spanning the entire start-to-end temporal range of the parquet file. |
+
 ---
 
 ## Development & Test Setup
