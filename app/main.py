@@ -131,7 +131,19 @@ async def get_geojson_data(
     parquet_url: str = Query(..., description="The full URL to the Parquet file."),
     start_time: str = Query(..., description="Start of the time range in ISO 8601 format (e.g., '2024-10-26T10:00:00Z')."),
     end_time: str = Query(..., description="End of the time range in ISO 8601 format (e.g., '2024-10-26T12:00:00Z')."),
-    columns: Optional[List[str]] = Query(None, alias="columns_to_extract", description="Optional list of column names to extract.")
+    columns: Optional[List[str]] = Query(None, alias="columns_to_extract", description="Optional list of column names to extract."),
+    lightning_min: float = Query(0, description="Minimum storm lightning group count filter."),
+    lightning_max: float = Query(5000, description="Maximum storm lightning group count filter."),
+    area_min: float = Query(0, description="Minimum storm lightning area filter."),
+    area_max: float = Query(5000, description="Maximum storm lightning area filter."),
+    duration_min: float = Query(0, description="Minimum recorded storm duration filter."),
+    duration_max: float = Query(121, description="Maximum recorded storm duration filter."),
+    lon_min: float = Query(-180, description="Minimum longitude filter for coordinate bounding box."),
+    lon_max: float = Query(180, description="Maximum longitude filter for coordinate bounding box."),
+    lat_min: float = Query(-90, description="Minimum latitude filter for coordinate bounding box."),
+    lat_max: float = Query(90, description="Maximum latitude filter for coordinate bounding box."),
+    surface_type: str = Query("all", description="Surface type filter ('all', 'land', or 'water')."),
+    earthcare_id: Optional[str] = Query("", description="EarthCARE ID filter.")
 ):
     """
     Directly queries a single Parquet file, filters the data by a specified
@@ -142,7 +154,19 @@ async def get_geojson_data(
             parquet_url=parquet_url,
             start_time=start_time,
             end_time=end_time,
-            columns_to_extract=columns
+            columns_to_extract=columns,
+            lightning_min=lightning_min,
+            lightning_max=lightning_max,
+            area_min=area_min,
+            area_max=area_max,
+            duration_min=duration_min,
+            duration_max=duration_max,
+            lon_min=lon_min,
+            lon_max=lon_max,
+            lat_min=lat_min,
+            lat_max=lat_max,
+            surface_type=surface_type,
+            earthcare_id=earthcare_id
         )
         # The service returns a GeoJSON string, so we parse it for a proper JSON response
         json_content = json.loads(geojson_data)
@@ -160,7 +184,11 @@ async def get_geojson_data(
 @app.get("/stac/geoparquet", summary="Generate a STAC Catalog for a GeoParquet file")
 async def get_stac_catalog(
     request: Request,
-    parquet_url: str = Query(..., description="The full URL to the Parquet file to be cataloged.")
+    parquet_url: str = Query(..., description="The full URL to the Parquet file to be cataloged."),
+    style_url: str = Query(
+        "https://workspace-ui-public.gtif-austria.hub-otc.eox.at/api/public/share/public-4wazei3y-02/assets/stormtracker_style.json",
+        description="The style file URL to be returned in the geoparquet/STAC item link."
+    )
 ):
     """
     Generates a STAC (SpatioTemporal Asset Catalog) for a given Parquet file.
@@ -178,7 +206,8 @@ async def get_stac_catalog(
         
         parquet_bytes = await get_stac_geoparquet_catalog(
             parquet_url=parquet_url,
-            service_base_url=service_base_url
+            service_base_url=service_base_url,
+            style_url=style_url
         )
         
         # Return the generated Parquet file as a streaming response

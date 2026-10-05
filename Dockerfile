@@ -1,33 +1,43 @@
+# Stage 1: Build stage
+FROM python:3.11-slim AS builder
 
-FROM ghcr.io/osgeo/gdal:ubuntu-small-3.9.2
-
-# Set the working directory in the container
 WORKDIR /app
 
-# Step 1: Install system deps
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
+# Install build tools for compiling any C extensions and apply security updates
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     build-essential \
-    python3-dev \
-    libblosc-dev \
-    libz-dev \
-    python3-pip
+    && rm -rf /var/lib/apt/lists/*
 
-# Step 2: Copy only requirements and install packages
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir -r requirements.txt --break-system-packages
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Step 3: Remove build tools to reduce final image size
-RUN apt-get purge -y \
-    build-essential \
-    python3-dev \
-    libblosc-dev \
-    libz-dev && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* /root/.cache
+# Stage 2: Minimal runtime stage
+FROM python:3.11-slim
 
-# Step 4: Copy source code into image
+WORKDIR /app
+
+# Apply latest security patches to the base OS libraries (resolves CVE-2026-103111 / libpcre2)
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+# Copy virtual environment from builder stage
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy application source code
 COPY . .
 
-USER www-data
+# Create a dedicated system non-root user and group
+RUN groupadd -r -g 10001 appgroup && \
+    useradd -r -u 10001 -g appgroup -m -d /home/appuser -s /sbin/nologin appuser && \
+    chown -R appuser:appgroup /app
+
+# Switch to the non-root user by UID for security standard compliance
+USER 10001:10001
+
+EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

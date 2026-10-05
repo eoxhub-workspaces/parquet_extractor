@@ -324,17 +324,29 @@ async def get_geojson_from_parquet_url(
     start_time: str,
     end_time: str,
     columns_to_extract: Optional[List[str]] = None,
+    lightning_min: float = 0,
+    lightning_max: float = 5000,
+    area_min: float = 0,
+    area_max: float = 5000,
+    duration_min: float = 0,
+    duration_max: float = 121,
+    lon_min: float = -180,
+    lon_max: float = 180,
+    lat_min: float = -90,
+    lat_max: float = 90,
+    surface_type: str = "all",
+    earthcare_id: Optional[str] = "",
 ) -> str:
     """
     Fetches and filters a single Parquet file by a time range and returns GeoJSON.
     """
     logger.info(f"Reading Parquet URL: {parquet_url}")
 
-    # Ensure geometry is always fetched if a column list is given
-    if columns_to_extract and "geometry" not in columns_to_extract:
-        columns_to_extract = columns_to_extract + ["geometry"]
-
-    select_clause = ", ".join(columns_to_extract) if columns_to_extract else "*"
+    # Keep track of the original columns requested by the user.
+    original_cols = []
+    if columns_to_extract:
+        for item in columns_to_extract:
+            original_cols.extend([col.strip() for col in item.split(",")])
 
     try:
         con = await asyncio.to_thread(_open_duckdb_sync, parquet_url)
@@ -350,6 +362,38 @@ async def get_geojson_from_parquet_url(
                 f"Column 'peak_datetime' not found in {parquet_url}. "
                 f"Available: {available}"
             )
+
+        # Columns that might be used by filters
+        filter_cols = [
+            "cluster_lightning",
+            "cluster_area_km2",
+            "duration_min",
+            "peak_lon",
+            "peak_lat",
+            "surface_type",
+            "earthcare_id"
+        ]
+        available_filter_cols = [col for col in filter_cols if col in available]
+
+        # Construct the final list of columns to query from DuckDB
+        if columns_to_extract:
+            columns_to_select = list(original_cols)
+            
+            # Ensure geometry is included if present in schema
+            if "geometry" not in columns_to_select and "geometry" in available:
+                columns_to_select.append("geometry")
+                
+            # Temporarily include any filter columns needed for pandas-side filtering
+            for col in available_filter_cols:
+                if col not in columns_to_select:
+                    columns_to_select.append(col)
+                    
+            # Filter select list to only columns that actually exist in the schema
+            columns_to_select = [col for col in columns_to_select if col in available]
+        else:
+            columns_to_select = None
+
+        select_clause = ", ".join(columns_to_select) if columns_to_select else "*"
 
         query = f"""
             SELECT {select_clause}
@@ -368,6 +412,41 @@ async def get_geojson_from_parquet_url(
     if df.empty:
         return json.dumps({"type": "FeatureCollection", "features": []})
 
+    # Apply Pandas DataFrame filtering based on dynamic query parameters
+    # 1. Storm Lightning Group Count (cluster_lightning)
+    if "cluster_lightning" in df.columns:
+        df = df[df["cluster_lightning"] >= lightning_min]
+        if lightning_max < 5000:
+            df = df[df["cluster_lightning"] <= lightning_max]
+
+    # 2. Storm Lightning Area (cluster_area_km2)
+    if "cluster_area_km2" in df.columns:
+        df = df[df["cluster_area_km2"] >= area_min]
+        if area_max < 5000:
+            df = df[df["cluster_area_km2"] <= area_max]
+
+    # 3. Recorded Storm Duration (duration_min)
+    if "duration_min" in df.columns:
+        df = df[(df["duration_min"] >= duration_min) & (df["duration_min"] <= duration_max)]
+
+    # 4. Coordinate Bounding Box (peak_lat and peak_lon)
+    if "peak_lon" in df.columns:
+        df = df[(df["peak_lon"] >= lon_min) & (df["peak_lon"] <= lon_max)]
+    if "peak_lat" in df.columns:
+        df = df[(df["peak_lat"] >= lat_min) & (df["peak_lat"] <= lat_max)]
+
+    # 5. Surface Type (surface_type)
+    if surface_type and surface_type != "all" and "surface_type" in df.columns:
+        df = df[df["surface_type"] == surface_type]
+
+    # 6. EarthCARE ID (earthcare_id)
+    if earthcare_id and earthcare_id.strip():
+        if "earthcare_id" in df.columns:
+            df = df[df["earthcare_id"] == earthcare_id.strip()]
+
+    if df.empty:
+        return json.dumps({"type": "FeatureCollection", "features": []})
+
     if "geometry" in df.columns:
         df["geometry"] = _normalise_wkb(df["geometry"])
 
@@ -381,6 +460,11 @@ async def get_geojson_from_parquet_url(
                 geometry = shapely_geometry.mapping(shapely.wkb.loads(geom_raw))
             except Exception:
                 pass
+
+        # If columns_to_extract was specified, only keep the original columns in properties
+        if original_cols:
+            props = {k: v for k, v in props.items() if k in original_cols}
+
         features.append({
             "type": "Feature",
             "geometry": geometry,
@@ -491,13 +575,13 @@ async def get_parquet_metadata(
 async def get_stac_geoparquet_catalog(
     parquet_url: str,
     service_base_url: str,
+    style_url: str = "https://workspace-ui-public.gtif-austria.hub-otc.eox.at/api/public/share/public-4wazei3y-02/assets/stormtracker_style.json",
 ) -> bytes:
     """
     Generates an items GeoParquet for monthly items based on the provided parquet.
     """
     try:
         metadata = await get_parquet_metadata(parquet_url, columns_to_inspect=["peak_datetime"])
-        style_url = "https://workspace-ui-public.gtif-austria.hub-otc.eox.at/api/public/share/public-4wazei3y-02/assets/stormtracker_style.json"
 
         all_min, all_max = [], []
         for group in metadata["row_group_statistics"]:

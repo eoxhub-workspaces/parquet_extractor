@@ -1,0 +1,24 @@
+# Exclude local virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Exclude Git files
+.git/
+.gitignore
+.github/
+
+# Exclude build and cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.dockerignore
+
+# Exclude local configs and docs
+*.md
+Dockerfile
